@@ -1,0 +1,23 @@
+rag-demo/
+├─ app/
+│  ├─ main.py                 # FastAPI 入口（挂 /v1/files /v1/tasks /v1/query）
+│  ├─ api/
+│  │  ├─ routes_files.py      # 上传/任务查询路由
+│  │  └─ routes_query.py      # 提问/答案查询路由
+│  ├─ services/
+│  │  ├─ ingest_service.py    # IngestService 的空实现（先返回假进度）
+│  │  └─ qa_service.py        # QAService 的空实现（先返回假答案）
+│  ├─ domain/
+│  │  └─ contracts.py         # ← 把你现在的 contracts_and_interfaces.py 放到这里
+│  ├─ core/
+│  │  ├─ settings.py          # 读取 Settings（pydantic）+ 全局单例
+│  │  └─ audit.py             # write_audit_log 的占位
+│  └─ utils/
+│     └─ ids.py               # 生成 file_id/task_id/answer_id 的小工具
+├─ tests/
+│  └─ test_smoke.py           # 冒烟测试：三个接口 200
+├─ requirements.txt           # 先只放跑通骨架需要的依赖
+├─ .env.example               # 可选：端口/Redis 地址等（先留空）
+└─ README.md
+
+
