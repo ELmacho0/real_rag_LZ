@@ -1,4 +1,3 @@
-import os
 from typing import Dict, Optional, List
 from collections import defaultdict
 
@@ -11,31 +10,18 @@ from app.retrieval.rewrite import generate_rewrites
 from app.retrieval.rerank import get_rerank_client
 from app.retrieval.fusion import Cand, score, is_unreliable_top
 from app.retrieval.keyword import tokenize, score_text  # 作为最终兜底
-from app.core.settings import get_settings
-
-import logging
-from app.core.settings import get_settings
 
 _ANSWERS: Dict[AnswerID, QAAnswer] = {}
-logger = logging.getLogger("qa")
-
-DEBUG_PREVIEW_CHARS = int(os.getenv("DEBUG_PREVIEW_CHARS", 120))  # 日志里截断长度
-DEBUG_SHOW_TOPN = int(os.getenv("DEBUG_SHOW_TOPN", 8))  # 日志最多展示条数
-RERANK_TOPN = int(os.getenv("RERANK_TOPN", 50))  # 送入 rerank 的上限
 
 
 class SimpleQAService(QAService):
-    def submit_query(self, owner_id: UserID, query: str, top_k: int = 8, session_id: Optional[str] = None,
-                     final_k: int | None = None) -> AnswerID:
+    def submit_query(self, owner_id: UserID, query: str, top_k: int = 8, session_id: Optional[str] = None, final_k: int | None = None) -> AnswerID:
         answer_id: AnswerID = new_id("ans_")
 
         # 0) 生成改写 Q*
         queries = generate_rewrites(query, k=4)  # [Q, R1..R4]（占位实现）
         if not queries:
             queries = [query]
-
-        s = get_settings()
-        logger.debug(f"[Q*] {queries}")
 
         # 1) 多路召回（收集候选，不使用 emb 相似度打最终分）
         cand_map: Dict[str, Cand] = {}  # chunk_id -> Cand（合并多路命中）
@@ -46,75 +32,63 @@ class SimpleQAService(QAService):
                 rewrite_weight_for[q] = 0.8
 
         # 1.1 内容向量召回
-        # try:
-        embedder = get_embedding_client()
-        for q in queries:
-            qvec = embedder.embed_texts([q])[0]
-            hits = query_topk(owner_id, qvec, top_k=4) or []
-            for h in hits:
-                md = h.get("metadata", {})
-                cid = h["id"]
-                c = cand_map.get(cid)
-                if not c:
-                    c = Cand(
-                        chunk_id=cid, doc_id=md.get("doc_id", ""), text=h.get("document", ""),
-                        page_from=md.get("page_from"), emb_sim=1.0 - float(h.get("distance", 1.0)),
-                        rewrite_weight=rewrite_weight_for.get(q, 0.8), class_bonus=0.0
-                    )
-                    cand_map[cid] = c
-
-                    emb = c.emb_sim
-                    emb_str = f"{emb:.3f}" if emb is not None else "-1.000"
-                    q_short = (q or "").replace("\n", " ")[:60]
-                    text_short = (c.text or "").replace("\n", " ")[:120]  # 120 可随意改
-                    logger.debug(
-                        "[vec-hit] q='%s' cid=%s doc=%s p=%s emb_sim=%s rw=%s text='%s'",
-                        q_short, cid, c.doc_id, c.page_from, emb_str, c.rewrite_weight, text_short
-                    )
-                else:
-                    c.multi_hit += 1
-                    c.rewrite_weight = max(c.rewrite_weight, rewrite_weight_for.get(q, 0.8))
-        # except Exception:
-        #     pass
+        try:
+            embedder = get_embedding_client()
+            for q in queries:
+                qvec = embedder.embed_texts([q])[0]
+                hits = query_topk(owner_id, qvec, top_k=4) or []
+                for h in hits:
+                    md = h.get("metadata", {})
+                    cid = h["id"]
+                    c = cand_map.get(cid)
+                    if not c:
+                        c = Cand(
+                            chunk_id=cid, doc_id=md.get("doc_id", ""), text=h.get("document", ""),
+                            page_from=md.get("page_from"), emb_sim=1.0 - float(h.get("distance", 1.0)),
+                            rewrite_weight=rewrite_weight_for.get(q, 0.8), class_bonus=0.0
+                        )
+                        cand_map[cid] = c
+                    else:
+                        c.multi_hit += 1
+                        c.rewrite_weight = max(c.rewrite_weight, rewrite_weight_for.get(q, 0.8))
+        except Exception:
+            pass
 
         # 1.2 标题索引召回（仅接受带 target_id 的标题，如 excel_sheet/table/chart）。
-        # try:
-        embedder = get_embedding_client()
-        qvec_main = embedder.embed_texts([queries[0]])[0]
-        title_hits = query_titles(owner_id, qvec_main, top_k=2) or []
-        target_ids: List[str] = []
-        for th in title_hits:
-            md = th.get("metadata", {})
-            target_id = md.get("target_id")
-            title_kind = md.get("title_kind")
-            # 仅当具备 target 切片时才纳入（避免 PDF 文件名噪声）
-            if not target_id or not title_kind:
-                continue
-            target_ids.append(target_id)
-        if target_ids:
-            chunks = get_by_ids(owner_id, target_ids)
-            for s in chunks:
-                smd = s.get("metadata", {})
-                cid = s["id"]
-                c = cand_map.get(cid)
-                if not c:
-                    c = Cand(
-                        chunk_id=cid, doc_id=smd.get("doc_id", ""), text=s.get("document", ""),
-                        page_from=smd.get("page_from"), emb_sim=None,
-                        rewrite_weight=0.6, class_bonus=(0.06 if smd.get("segment_type") == "table" else (
-                            0.03 if smd.get("segment_type") == "chart" else 0.0)),
-                        title_hit=True
-                    )
-                    cand_map[cid] = c
-                    logger.debug(
-                        f"[title-hit] target_id={cid} doc={c.doc_id} st_bonus={c.class_bonus} rw={c.rewrite_weight} text='{_short(c.text, s.DEBUG_PREVIEW_CHARS)}'")
-
-                else:
-                    c.title_hit = True
-                    c.rewrite_weight = max(c.rewrite_weight, 0.6)
-                    c.multi_hit += 1
-        # except Exception:
-        #     pass
+        try:
+            embedder = get_embedding_client()
+            qvec_main = embedder.embed_texts([queries[0]])[0]
+            title_hits = query_titles(owner_id, qvec_main, top_k=2) or []
+            target_ids: List[str] = []
+            for th in title_hits:
+                md = th.get("metadata", {})
+                target_id = md.get("target_id")
+                title_kind = md.get("title_kind")
+                # 仅当具备 target 切片时才纳入（避免 PDF 文件名噪声）
+                if not target_id or not title_kind:
+                    continue
+                target_ids.append(target_id)
+            if target_ids:
+                chunks = get_by_ids(owner_id, target_ids)
+                for s in chunks:
+                    smd = s.get("metadata", {})
+                    cid = s["id"]
+                    c = cand_map.get(cid)
+                    if not c:
+                        c = Cand(
+                            chunk_id=cid, doc_id=smd.get("doc_id", ""), text=s.get("document", ""),
+                            page_from=smd.get("page_from"), emb_sim=None,
+                            rewrite_weight=0.6, class_bonus=(0.06 if smd.get("segment_type") == "table" else (
+                                0.03 if smd.get("segment_type") == "chart" else 0.0)),
+                            title_hit=True
+                        )
+                        cand_map[cid] = c
+                    else:
+                        c.title_hit = True
+                        c.rewrite_weight = max(c.rewrite_weight, 0.6)
+                        c.multi_hit += 1
+        except Exception:
+            pass
 
         # 1.3 邻近强制召回：仅“之后最近的 table/chart”
         #    对前 Top-N=6 个已存在候选（按当前收集量排序即可）逐一处理
@@ -150,12 +124,6 @@ class SimpleQAService(QAService):
                         neighbor_boost=True
                     )
                     cand_map[cid] = c
-                    logger.debug(
-                        f"[neighbor] base(doc={base.doc_id}, p={base.page_from}) -> cid={cid} p={c.page_from} "
-                        f"gap={c.page_from - base.page_from if (c.page_from is not None and base.page_from is not None) else 'NA'} "
-                        f"class_bonus={c.class_bonus} text='{_short(c.text, s.DEBUG_PREVIEW_CHARS)}'"
-                    )
-
                 else:
                     c.neighbor_boost = True
                     c.rewrite_weight = max(c.rewrite_weight, 0.6)
@@ -171,36 +139,16 @@ class SimpleQAService(QAService):
         rerank = get_rerank_client()
         docs = [c.text for c in candidates]
         topn = min(len(docs), get_settings().RERANK_TOPN if hasattr(get_settings(), "RERANK_TOPN") else 50)
-        # try:
-        rr = rerank.rerank(query=queries[0], documents=docs, top_n=topn, return_documents=False)
-        # 将 rerank 分数写回到候选（按 index 对齐）
-        for item in rr:
-            idx = item["index"]
-            if 0 <= idx < len(candidates):
-                candidates[idx].rel = float(item.get("score", 0.0))
-        # except Exception:
-        #     # rerank 失败：rel 全 0，按其他 boost 兜底
-        #     pass
-
-        # rerank 返回后，把分数对齐写回时顺手打印前 N
-        # try:
-        rr = rerank.rerank(query=queries[0], documents=docs, top_n=topn, return_documents=False)
-        for item in rr:
-            idx = item["index"]
-            if 0 <= idx < len(candidates):
-                candidates[idx].rel = float(item.get("score", 0.0))
-        logger.debug(f"[rerank] got {len(rr)} scores; top {min(len(rr), 4)}:")
-        # 打出按得分降序的前 N
-        tmp = sorted([(i, c.rel) for i, c in enumerate(candidates)], key=lambda t: t[1], reverse=True)[
-              :4]
-        for rank, (i, rel) in enumerate(tmp, 1):
-            c = candidates[i]
-            logger.debug(
-                f"  R{rank} rel={rel:.3f} cid={c.chunk_id} doc={c.doc_id} p={c.page_from} {_flags(c)} "
-                f"text='{_short(c.text, DEBUG_PREVIEW_CHARS)}'"
-            )
-        # except Exception as e:
-        #     logger.exception(f"[rerank] failed: {e}")
+        try:
+            rr = rerank.rerank(query=queries[0], documents=docs, top_n=topn, return_documents=False)
+            # 将 rerank 分数写回到候选（按 index 对齐）
+            for item in rr:
+                idx = item["index"]
+                if 0 <= idx < len(candidates):
+                    candidates[idx].rel = float(item.get("score", 0.0))
+        except Exception:
+            # rerank 失败：rel 全 0，按其他 boost 兜底
+            pass
 
         # 3) 融合打分 & 无答案规则
         ranked = sorted(candidates, key=score, reverse=True)
@@ -234,22 +182,6 @@ class SimpleQAService(QAService):
             citations=citations,
             no_answer_reason=None
         )
-
-        # 融合打分排序后，打印最终前 N：
-        ranked = sorted(candidates, key=score, reverse=True)
-        logger.debug(f"[final-rank] show top {min(len(ranked), s.DEBUG_SHOW_TOPN)}")
-        for i, c in enumerate(ranked[:s.DEBUG_SHOW_TOPN], 1):
-            logger.debug(
-                f"  #{i} score={score(c):.3f} rel={c.rel:.3f} {_flags(c)} class={c.class_bonus:.2f} "
-                f"cid={c.chunk_id} doc={c.doc_id} p={c.page_from} text='{_short(c.text, s.DEBUG_PREVIEW_CHARS)}'"
-            )
-
-        # 成功返回时打印最终引用（你前面已经支持可配置数量的话，这里按你的 final_k 打）
-        logger.info(
-            f"[answer] text='{_short(preview, 180)}' "
-            f"citations={[(c.doc_id, c.chunk_id) for c in citations]}"
-        )
-
         return answer_id
 
     def get_answer(self, answer_id: AnswerID) -> QAAnswer:
@@ -258,16 +190,6 @@ class SimpleQAService(QAService):
             return QAAnswer(answer_id=answer_id, stage=QAStage.failed, text=None, citations=[],
                             no_answer_reason="answer_not_found")
         return ans
-
-
-def _short(s: str, n: int) -> str:
-    if not s: return ""
-    s = s.replace("\n", " ").strip()
-    return s if len(s) <= n else s[:n] + "…"
-
-
-def _flags(c) -> str:
-    return f"title={int(c.title_hit)} neigh={int(c.neighbor_boost)} appx={int(c.appendix_boost)} multi={c.multi_hit}"
 
 
 qa_service = SimpleQAService()
