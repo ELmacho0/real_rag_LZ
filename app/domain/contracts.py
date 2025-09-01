@@ -14,10 +14,29 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 import os
+from functools import lru_cache
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 # =========================
 # 枚举与类型别名
 # =========================
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    LOG_LEVEL: str = "INFO"
+    DEBUG_PREVIEW_CHARS: int = 120
+    DEBUG_SHOW_TOPN: int = 8
+    RERANK_TOPN: int = 50
+    # 其它原有字段也放这里（EMB_BASE_URL/KEY, CHROMA_PATH, RERANK_MODEL 等）
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
 
 class FileType(str, Enum):
     pdf_text = "pdf_text"
@@ -84,6 +103,11 @@ class Settings(BaseSettings):
     EMB_API_KEY: str = os.getenv("DASHSCOPE_API_KEY")  # 从环境变量读取，别写死
     print(EMB_API_KEY)
     EMBEDDING_MODEL: str = "text-embedding-v4"  # 你原来已有就沿用
+
+    # —— 日志配置 ——
+    LOG_LEVEL: str = "DEBUG"
+    DEBUG_PREVIEW_CHARS: int = 120  # 日志里每条文本最多打印这么多字符
+    DEBUG_SHOW_TOPN: int = 4  # rerank/最终排名等每次最多展示多少条
 
     # —— Chroma 存储路径 ——
     CHROMA_PATH: str = "./data/chroma"
@@ -154,7 +178,6 @@ class Settings(BaseSettings):
 
     # —— 模型选择 ——
     LLM_CHAT_MODEL: str = "qwen-turbo"  # 示例；实际以你接的提供商为准
-
 
 
 # =========================

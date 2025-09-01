@@ -10,3 +10,4 @@ chromadb~=0.5.3
 requests~=2.32.3
 pathlib~=1.0.1
 dashscope
+openpyxl~=3.1.5

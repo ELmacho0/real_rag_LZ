@@ -152,20 +152,24 @@ class SimpleIngestService(IngestService):
                         title_guess="",
                         page_estimated=False,
                         appendix_flag=False,
-                        neighbors=NeighborInfo(),
+                        # ↓↓↓ 这四个都可以不写，默认 None。先保留做占位，后面接邻近召回时再填。
+                        neighbors_prev_page=None,
+                        neighbors_next_page=None,
+                        neighbors_prev_chunk_id=None,
+                        neighbors_next_chunk_id=None,
                     )
                     chunks.append(Chunk(chunk_id=chunk_id, text=rc["text"], metadata=meta_obj))
                 _DOC_CHUNKS[doc_id] = chunks
-                try:
-                    embedder = get_embedding_client()  # 若未配置会抛异常，我们捕获后允许回退
-                    texts = [c.text for c in chunks]
-                    vecs = embedder.embed_texts(texts)
-                    upsert_chunks(owner_id, chunks, vecs)
-                    upsert_title(owner_id, doc_id, title_text=filename, filename=filename)
-                except Exception as e:
-                    # 记录一下即可（此阶段允许无向量索引，问答会回退到关键词）
-                    print("向量写入失败")
-                    pass
+                # try:
+                embedder = get_embedding_client()  # 若未配置会抛异常，我们捕获后允许回退
+                texts = [c.text for c in chunks]
+                vecs = embedder.embed_texts(texts)
+                upsert_chunks(owner_id, chunks, vecs)
+                upsert_title(owner_id, doc_id, title_text=filename, filename=filename)
+                # except Exception as e:
+                #     # 记录一下即可（此阶段允许无向量索引，问答会回退到关键词）
+                #     print("向量写入失败")
+                #     pass
             else:
                 # OCR 失败或环境缺依赖：先不抛错，允许任务继续；问答时会 NO_ANSWER
                 _DOC_CHUNKS[doc_id] = []
