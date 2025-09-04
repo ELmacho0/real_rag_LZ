@@ -204,15 +204,17 @@ class SimpleIngestService(IngestService):
         # 4) 若为 PDF：用 PyMuPDF 读取页数，并粗略判断是否扫描件
         # 注意：guess_file_type() 对 ".pdf" 先归类为 pdf_text，若判定扫描则改成 pdf_scan
         total = 0
-        is_scanned = 0
+        is_scanned = False
         if saved_path.suffix.lower() == ".pdf":
             total, is_scanned, stats = inspect_pdf(saved_path)
         # 这里 total=0 可能是 pymupdf 不可用或文件异常；不抛错，仅记录
         if total and total > 0:
             meta.page_count = total
+        # 仅在 PDF 被判定为扫描件时才改写 file_type
         if is_scanned:
             meta.file_type = FileType.pdf_scan
         # 也可以把 stats 打日志，便于调试（此处略）
+            print(meta.file_type)
 
         # 5) 记录映射 & 元信息
         _FILES_RAW[file_id] = {
