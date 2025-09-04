@@ -1,3 +1,4 @@
+# app/services/ingest_service.py
 from datetime import datetime
 from typing import Tuple, Dict, Optional, List
 from pathlib import Path
@@ -19,8 +20,6 @@ from app.storage.excel_extractor import iter_excel_sheets
 from app.storage.vectorstore_chroma import upsert_chunks, upsert_title
 from app.llm.embeddings import get_embedding_client
 from app.llm.vision import analyze_image, table_json_to_text
-
-
 
 # —— 内存态“数据库”（演示用） ——
 _TASKS: Dict[TaskID, dict] = {}  # task_id -> {start, duration, doc_id, ...}
@@ -69,7 +68,8 @@ class SimpleIngestService(IngestService):
             kind = str(obj.get("kind", cand.kind_hint)).lower()
             title = obj.get("title", "") or ""
             if kind == "table":
-                payload_text = table_json_to_text(str(obj.get("table")))
+                payload_text = obj.get("text", "")
+                payload_text = table_json_to_text(str(payload_text))
                 seg_type = SegmentType.table
             elif kind == "chart":
                 payload_text = obj.get("text", "") or title
@@ -119,9 +119,10 @@ class SimpleIngestService(IngestService):
             obj = analyze_image(tb.png_bytes)
             kind = str(obj.get("kind", "table")).lower()
             title = obj.get("title", "") or ""
-            table = obj.get("table")
+
             if kind == "table":
-                payload_text = table_json_to_text(str(table))
+                payload_text = obj.get("text", "")
+                payload_text = table_json_to_text(str(payload_text))
                 seg_type = SegmentType.table
             else:
                 payload_text = obj.get("text", "") or title
@@ -200,9 +201,10 @@ class SimpleIngestService(IngestService):
         # 3) 落盘原始文件（data/original/{owner}/{doc}/original.ext）
         saved_path: Path = save_original(owner_id, doc_id, filename, file_bytes)
 
-
         # 4) 若为 PDF：用 PyMuPDF 读取页数，并粗略判断是否扫描件
         # 注意：guess_file_type() 对 ".pdf" 先归类为 pdf_text，若判定扫描则改成 pdf_scan
+        total = 0
+        is_scanned = 0
         if saved_path.suffix.lower() == ".pdf":
             total, is_scanned, stats = inspect_pdf(saved_path)
         # 这里 total=0 可能是 pymupdf 不可用或文件异常；不抛错，仅记录
@@ -245,10 +247,10 @@ class SimpleIngestService(IngestService):
                 upsert_title(owner_id, doc_id, title_text=filename, filename=filename)
                 for c in chunks:
                     if c.metadata.segment_type in (
-                        SegmentType.table,
-                        SegmentType.chart,
-                        SegmentType.figure,
-                        SegmentType.excel_sheet,
+                            SegmentType.table,
+                            SegmentType.chart,
+                            SegmentType.figure,
+                            SegmentType.excel_sheet,
                     ) and c.metadata.title_guess:
                         upsert_title(
                             owner_id=owner_id,

@@ -17,7 +17,7 @@ PROMPT = (
     - 识别图片的标题，如果没有识别到标题，则根据内容猜测一个标题\n\n
     - 如果判断判断是table，则将该表格结构化成JSON格式；如果是其他，则转化成对其内容的详细描述\n
     输出格式如下：\n
-    {"kind": "table|chart|figure|photo",\n "title": "<识别/推断的标题>",\n  "text": "<单纯的表格的JSON，或其他内容的详细描述>"\n}\n"""
+    {"kind": "table|chart|figure",\n "title": "<识别/推断的标题>",\n  "text": "<单纯的表格的JSON，或其他内容的详细描述>"\n}\n"""
     "要求：严格按照我的输出格式输出，不要输出其他内容！"
 )
 _client: OpenAI | None = None
