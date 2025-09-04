@@ -1,0 +1,30 @@
+# app/storage/docx_pdf.py
+from __future__ import annotations
+import os, tempfile, shutil
+from pathlib import Path
+
+
+def docx_to_pdf(input_path: str) -> str:
+    """
+    将 .docx 转为 .pdf，返回生成的 PDF 路径。
+    - 优先使用 docx2pdf（Windows 下依赖已安装的 MS Word）
+    - 失败则抛异常（后续你需要备用方案可再加）
+    """
+    from docx2pdf import convert  # 延迟导入，避免非 Windows 环境报错
+
+    input_path = str(Path(input_path).resolve())
+    if not input_path.lower().endswith(".docx"):
+        raise ValueError("docx_to_pdf only accepts .docx")
+
+    tmpdir = tempfile.mkdtemp(prefix="docx2pdf_")
+    out_pdf = str(Path(tmpdir) / (Path(input_path).stem + ".pdf"))
+    try:
+        # docx2pdf 支持 (in_file, out_file) 直接转换
+        convert(input_path, out_pdf)
+        if not os.path.exists(out_pdf):
+            raise RuntimeError("docx2pdf convert finished but output missing")
+        return out_pdf
+    except Exception as e:
+        # 清理并上抛，方便上层 fallback（如果以后你要加备用方案）
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise

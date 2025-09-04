@@ -1,164 +1,79 @@
-from typing import Dict, Optional, List
-from collections import defaultdict
-
-from app.utils.ids import new_id
-from app.domain.contracts import QAService, UserID, QARequest, AnswerID, QAAnswer, QAStage, Citation
-from app.services.ingest_service import DOC_CHUNKS, FILES_RAW, DOC_TO_FILE
+# app/services/ingest_service.py 片段（示意）
+from app.storage.pdf_scan_detect import scan_pdf_tables_and_text
+from app.llm.vision import analyze_image, table_json_to_text
 from app.llm.embeddings import get_embedding_client
-from app.storage.vectorstore_chroma import query_topk, query_titles, get_chunks_by_doc, get_by_ids, get_doc_segments
-from app.retrieval.rewrite import generate_rewrites
-from app.retrieval.rerank import get_rerank_client
-from app.retrieval.fusion import Cand, score, is_unreliable_top
+from app.storage.vectorstore_chroma import upsert_chunks, upsert_title
+from app.domain.contracts import Chunk, ChunkMeta, SegmentType
+from app.utils.ids import new_id
 
-_ANSWERS: Dict[AnswerID, QAAnswer] = {}
+def _ingest_pdf_scanned(owner_id: str, doc_id: str, filename: str, pdf_path: str):
+    # 1) 扫描件专用：拿“表格裁片 + 遮蔽表格后的页面文本”
+    page_texts, table_crops = scan_pdf_tables_and_text(pdf_path, dpi=300)
 
-class SimpleQAService(QAService):
-    def submit_query(self, owner_id: UserID, query: str, top_k: int = 8, session_id: Optional[str] = None) -> AnswerID:
-        answer_id: AnswerID = new_id("ans_")
+    chunks: list[Chunk] = []
 
-        # 0) 生成改写 Q*
-        queries = generate_rewrites(query, k=4)  # [Q, R1..R4]（占位实现）
-        if not queries:
-            queries = [query]
+    # 2) 文本页 → 切片（简单：一页一片，或拼成长段再按窗口切）
+    for pt in page_texts:
+        text = pt.text.strip()
+        if not text:
+            continue
+        # 可按你现有的窗口/重叠策略，这里先一页一片
+        meta = ChunkMeta(
+            doc_id=doc_id,
+            segment_type=SegmentType.text,
+            page_from=pt.page,
+            page_to=pt.page,
+            title_guess="",
+            page_estimated=False,
+            appendix_flag=False,
+        )
+        chunks.append(Chunk(chunk_id=new_id("seg_"), text=text, metadata=meta))
 
-        # 1) 多路召回（收集候选，不使用 emb 相似度打最终分）
-        cand_map: Dict[str, Cand] = {}     # chunk_id -> Cand（合并多路命中）
-        rewrite_weight_for = {}            # 文本 query -> 权重
-        if queries:
-            rewrite_weight_for[queries[0]] = 1.0
-            for q in queries[1:]:
-                rewrite_weight_for[q] = 0.8
+    # 3) 表格裁片 → 视觉 LLM 判类 + 文本化
+    for tb in table_crops:
+        obj = analyze_image(tb.png_bytes)  # {kind,title,text,table:{...}}
+        kind = str(obj.get("kind","table")).lower()
+        title = obj.get("title","") or ""
+        table = obj.get("table") or {"headers":[],"rows":[],"notes":[]}
+        if kind == "table":
+            payload_text = table_json_to_text(table)
+            seg_type = SegmentType.table
+            class_bonus_hint = "table"
+        else:
+            # 扫描件里通常不会识别成 chart/figure，但保留兼容
+            payload_text = obj.get("text","") or title
+            seg_type = SegmentType.figure if kind not in ("chart","photo") else SegmentType.chart
+            class_bonus_hint = "chart" if kind=="chart" else "figure"
 
-        # 1.1 内容向量召回
-        try:
-            embedder = get_embedding_client()
-            for q in queries:
-                qvec = embedder.embed_texts([q])[0]
-                hits = query_topk(owner_id, qvec, top_k=max(8, top_k)) or []
-                for h in hits:
-                    md = h.get("metadata", {})
-                    cid = h["id"]
-                    c = cand_map.get(cid)
-                    if not c:
-                        c = Cand(
-                            chunk_id=cid, doc_id=md.get("doc_id",""), text=h.get("document",""),
-                            page_from=md.get("page_from"), emb_sim=1.0 - float(h.get("distance", 1.0)),
-                            rewrite_weight=rewrite_weight_for.get(q, 0.8), class_bonus=0.0
-                        )
-                        cand_map[cid] = c
-                    else:
-                        c.multi_hit += 1
-                        c.rewrite_weight = max(c.rewrite_weight, rewrite_weight_for.get(q, 0.8))
-        except Exception:
-            pass
+        meta = ChunkMeta(
+            doc_id=doc_id,
+            segment_type=seg_type,
+            page_from=tb.page,
+            page_to=tb.page,
+            title_guess=title,
+            page_estimated=False,
+            appendix_flag=False,
+        )
+        chunks.append(Chunk(chunk_id=new_id("seg_"), text=payload_text, metadata=meta))
 
-        # 1.2 标题索引召回（仅接受带 target_id 的标题，如 excel_sheet/table/chart）。
-        try:
-            embedder = get_embedding_client()
-            qvec_main = embedder.embed_texts([queries[0]])[0]
-            title_hits = query_titles(owner_id, qvec_main, top_k=2) or []
-            target_ids: List[str] = []
-            for th in title_hits:
-                md = th.get("metadata", {})
-                target_id = md.get("target_id")
-                title_kind = md.get("title_kind")
-                # 仅当具备 target 切片时才纳入（避免 PDF 文件名噪声）
-                if not target_id or not title_kind:
-                    continue
-                target_ids.append(target_id)
-            if target_ids:
-                chunks = get_by_ids(owner_id, target_ids)
-                for s in chunks:
-                    smd = s.get("metadata", {})
-                    cid = s["id"]
-                    c = cand_map.get(cid)
-                    if not c:
-                        c = Cand(
-                            chunk_id=cid, doc_id=smd.get("doc_id",""), text=s.get("document",""),
-                            page_from=smd.get("page_from"), emb_sim=None,
-                            rewrite_weight=0.6, class_bonus=(0.06 if smd.get("segment_type") == "table" else (0.03 if smd.get("segment_type") == "chart" else 0.0)),
-                            title_hit=True
-                        )
-                        cand_map[cid] = c
-                    else:
-                        c.title_hit = True
-                        c.rewrite_weight = max(c.rewrite_weight, 0.6)
-                        c.multi_hit += 1
-        except Exception:
-            pass
+    # 4) 入向量库
+    if chunks:
+        embedder = get_embedding_client()
+        vecs = embedder.embed_texts([c.text for c in chunks])
+        upsert_chunks(owner_id, chunks, vecs)
 
-        # 1.3 邻近强制召回：仅“之后最近的 table/chart”
-        #    对前 Top-N=6 个已存在候选（按当前收集量排序即可）逐一处理
-        base_cands = list(cand_map.values())[:6]
-        for base in base_cands:
-            if not base.doc_id or base.page_from is None:
-                continue
-            segs = get_doc_segments(owner_id, base.doc_id)
-            # 在同一文档中过滤 table/chart，且 page_from > base.page_from，取最小差值者
-            next_tc = None
-            next_gap = 10**9
-            for s in segs:
-                md = s.get("metadata", {})
-                if md.get("segment_type") not in ("table", "chart"):
-                    continue
-                p = md.get("page_from")
-                if p is None or p <= base.page_from:
-                    continue
-                gap = p - base.page_from
-                if gap < next_gap:
-                    next_gap = gap
-                    next_tc = s
-            if next_tc:
-                smd = next_tc.get("metadata", {})
-                cid = next_tc["id"]
-                c = cand_map.get(cid)
-                if not c:
-                    c = Cand(
-                        chunk_id=cid, doc_id=smd.get("doc_id",""), text=next_tc.get("document",""),
-                        page_from=smd.get("page_from"), emb_sim=None,
-                        rewrite_weight=0.6, class_bonus=(0.06 if smd.get("segment_type") == "table" else 0.03),
-                        neighbor_boost=True
-                    )
-                    cand_map[cid] = c
-                else:
-                    c.neighbor_boost = True
-                    c.rewrite_weight = max(c.rewrite_weight, 0.6)
-                    c.multi_hit += 1
+        # 5) 将非文字切片写入标题索引（便于“标题命中 → 直达该切片”）
+        for c in chunks:
+            if c.metadata.segment_type in (SegmentType.table, SegmentType.chart) and c.metadata.title_guess:
+                upsert_title(
+                    owner_id=owner_id,
+                    doc_id=doc_id,
+                    title_text=c.metadata.title_guess,
+                    filename=filename,
+                    # 如果你已把 upsert_title 增强为可写元数据：
+                    title_kind=c.metadata.segment_type.value,
+                    target_id=c.chunk_id,
+                )
 
-        # 2) 聚合候选，送入 reranker
-        candidates = list(cand_map.values())
-        if not candidates:
-            _ANSWERS[answer_id] = QAAnswer(answer_id=answer_id, stage=QAStage.no_answer, text=None, citations=[], no_answer_reason="no_candidates")
-            return answer_id
-
-        rerank = get_rerank_client()
-        docs = [c.text for c in candidates]
-        topn = min(len(docs), get_settings().RERANK_TOPN if hasattr(get_settings(), "RERANK_TOPN") else 50)
-        try:
-            rr = rerank.rerank(query=queries[0], documents=docs, top_n=topn, return_documents=False)
-            # 将 rerank 分数写回到候选（按 index 对齐）
-            for item in rr:
-                idx = item["index"]
-                if 0 <= idx < len(candidates):
-                    candidates[idx].rel = float(item.get("score", 0.0))
-        except Exception:
-            # rerank 失败：rel 全 0，按其他 boost 兜底
-            pass
-
-        # 3) 融合打分 & 无答案规则
-        ranked = sorted(candidates, key=score, reverse=True)
-        top = ranked[0]
-        if is_unreliable_top(top):
-            _ANSWERS[answer_id] = QAAnswer(answer_id=answer_id, stage=QAStage.no_answer, text=None, citations=[], no_answer_reason="low_confidence")
-            return answer_id
-
-        # 4) 组装引用
-        file_id = DOC_TO_FILE.get(top.doc_id, "")
-        file_rec = FILES_RAW.get(file_id, {})
-        filename = file_rec.get("filename", "unknown")
-        preview = (top.text or "").strip().replace("\n", " ")
-        if len(preview) > 400:
-            preview = preview[:400] + "…"
-        citation = Citation(doc_id=top.doc_id, chunk_id=top.chunk_id, filename=filename, page_hint=(f"p.{top.page_from}" if top.page_from else None))
-        _ANSWERS[answer_id] = QAAnswer(answer_id=answer_id, stage=QAStage.done, text=f"【融合+Rerank】{preview}", citations=[citation], no_answer_reason=None)
-        return answer_id
+    # 6) 写入内存缓存，方便调试预览
+    DOC_CHUNKS[doc_id] = DOC_CHUNKS.get(doc_id, []) + chunks

@@ -79,17 +79,19 @@ def get_or_create_title_collection(owner_id: str):
         return client.create_collection(name=name, metadata={"hnsw:space": "cosine"})
 
 
-def upsert_title(owner_id: str, doc_id: str, title_text: str, filename: str):
-    """把文件名等加入标题索引。id 用 title_{doc_id}，metadata 里保留 doc_id/filename。"""
+def upsert_title(owner_id: str, doc_id: str, title_text: str, filename: str, *, title_kind: str | None = None, target_id: str | None = None):
     if not title_text:
         return
     col = get_or_create_title_collection(owner_id)
     embedder = get_embedding_client()
     vec = embedder.embed_texts([title_text])[0]
+    meta = {"doc_id": doc_id, "filename": filename}
+    if title_kind: meta["title_kind"] = title_kind
+    if target_id: meta["target_id"] = target_id
     col.upsert(
-        ids=[f"title_{doc_id}"],
+        ids=[f"title_{doc_id}_{(target_id or 'doc').replace(' ','_')}"],
         documents=[title_text],
-        metadatas=[{"doc_id": doc_id, "filename": filename}],
+        metadatas=[meta],
         embeddings=[vec],
     )
 

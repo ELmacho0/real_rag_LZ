@@ -11,10 +11,18 @@ from app.core.settings import get_settings
 from app.core.limits import check_limits
 from app.storage.files import compute_doc_id, guess_file_type, save_original
 from app.storage.pdf_inspect import inspect_pdf
+from app.storage.docx_pdf import docx_to_pdf
 from app.storage.text_extractor import iter_pdf_page_texts, make_text_chunks_from_pages
 from app.storage.ocr_extractor import pdf_ocr_to_pages
-from app.llm.embeddings import get_embedding_client
+from app.storage.pdf_scan_detect import scan_pdf_tables_and_text
+from app.storage.pdf_visual import harvest_visual_cands
 from app.storage.vectorstore_chroma import upsert_chunks, upsert_title
+from app.llm.embeddings import get_embedding_client
+from app.llm.vision import analyze_image, table_json_to_text
+from app.llm.embeddings import get_embedding_client
+from app.utils.ids import new_id
+
+
 
 # —— 内存态“数据库”（演示用） ——
 _TASKS: Dict[TaskID, dict] = {}  # task_id -> {start, duration, doc_id, ...}
@@ -40,6 +48,7 @@ class SimpleIngestService(IngestService):
     """
 
     def schedule_ingest(self, owner_id: UserID, filename: str, mime: str, file_bytes: bytes) -> Tuple[FileID, TaskID]:
+
         settings = get_settings()
         now = datetime.utcnow()
 
@@ -74,6 +83,7 @@ class SimpleIngestService(IngestService):
 
         # 3) 落盘原始文件（data/original/{owner}/{doc}/original.ext）
         saved_path: Path = save_original(owner_id, doc_id, filename, file_bytes)
+
 
         # 4) 若为 PDF：用 PyMuPDF 读取页数，并粗略判断是否扫描件
         # 注意：guess_file_type() 对 ".pdf" 先归类为 pdf_text，若判定扫描则改成 pdf_scan
@@ -137,39 +147,78 @@ class SimpleIngestService(IngestService):
 
         # 6.1) 扫描型 PDF：逐页 OCR → 切片（与文本型相同窗口策略）
         elif meta.file_type in (FileType.pdf_scan,):
-            pages = pdf_ocr_to_pages(saved_path, dpi=220)  # 扫描件略提 DPI 提升准确率
-            if pages:
-                raw_chunks = make_text_chunks_from_pages(doc_id, pages, window_min=300, window_max=500, overlap=100)
-                chunks: List[Chunk] = []
-                for rc in raw_chunks:
-                    chunk_id = new_id("chk_")
-                    meta_obj = ChunkMeta(
-                        chunk_id=chunk_id,
-                        doc_id=doc_id,
-                        segment_type=SegmentType.text,
-                        page_from=rc["page_from"],
-                        page_to=rc["page_to"],
-                        title_guess="",
-                        page_estimated=False,
-                        appendix_flag=False,
-                        neighbors=NeighborInfo(),
-                    )
-                    chunks.append(Chunk(chunk_id=chunk_id, text=rc["text"], metadata=meta_obj))
-                _DOC_CHUNKS[doc_id] = chunks
-                try:
-                    embedder = get_embedding_client()  # 若未配置会抛异常，我们捕获后允许回退
-                    texts = [c.text for c in chunks]
-                    vecs = embedder.embed_texts(texts)
-                    upsert_chunks(owner_id, chunks, vecs)
-                    upsert_title(owner_id, doc_id, title_text=filename, filename=filename)
-                except Exception as e:
-                    # 记录一下即可（此阶段允许无向量索引，问答会回退到关键词）
-                    print("向量写入失败")
-                    pass
-            else:
-                # OCR 失败或环境缺依赖：先不抛错，允许任务继续；问答时会 NO_ANSWER
-                _DOC_CHUNKS[doc_id] = []
+            page_texts, table_crops = scan_pdf_tables_and_text(str(saved_path), dpi=300)
 
+            chunks: list[Chunk] = []
+
+            # 2) 文本页 → 切片（简单：一页一片，或拼成长段再按窗口切）
+            for pt in page_texts:
+                text = pt.text.strip()
+                if not text:
+                    continue
+                # 可按你现有的窗口/重叠策略，这里先一页一片
+                chunk_id = new_id("seg_")
+                meta = ChunkMeta(
+                    chunk_id=chunk_id,
+                    doc_id=doc_id,
+                    segment_type=SegmentType.text,
+                    page_from=pt.page,
+                    page_to=pt.page,
+                    title_guess="",
+                    page_estimated=False,
+                    appendix_flag=False,
+                )
+                chunks.append(Chunk(chunk_id=chunk_id, text=text, metadata=meta))
+
+            # 3) 表格裁片 → 视觉 LLM 判类 + 文本化
+            for tb in table_crops:
+                obj = analyze_image(tb.png_bytes)  # {kind,title,text,table:{...}}
+                kind = str(obj.get("kind", "table")).lower()
+                title = obj.get("title", "") or ""
+                table = obj.get("text")
+                if kind == "table":
+                    payload_text = table_json_to_text(str(table))
+                    seg_type = SegmentType.table
+                    class_bonus_hint = "table"
+                else:
+                    # 扫描件里通常不会识别成 chart/figure，但保留兼容
+                    payload_text = obj.get("text", "") or title
+                    seg_type = SegmentType.figure if kind not in ("chart", "photo") else SegmentType.chart
+                    class_bonus_hint = "chart" if kind == "chart" else "figure"
+
+                meta = ChunkMeta(
+                    chunk_id=chunk_id,
+                    doc_id=doc_id,
+                    segment_type=seg_type,
+                    page_from=tb.page,
+                    page_to=tb.page,
+                    title_guess=title,
+                    page_estimated=False,
+                    appendix_flag=False,
+                )
+                chunks.append(Chunk(chunk_id=new_id("seg_"), text=payload_text, metadata=meta))
+
+            # 4) 入向量库
+            if chunks:
+                embedder = get_embedding_client()
+                vecs = embedder.embed_texts([c.text for c in chunks])
+                upsert_chunks(owner_id, chunks, vecs)
+
+                # 5) 将非文字切片写入标题索引（便于“标题命中 → 直达该切片”）
+                for c in chunks:
+                    if c.metadata.segment_type in (SegmentType.table, SegmentType.chart) and c.metadata.title_guess:
+                        upsert_title(
+                            owner_id=owner_id,
+                            doc_id=doc_id,
+                            title_text=c.metadata.title_guess,
+                            filename=filename,
+                            # 如果你已把 upsert_title 增强为可写元数据：
+                            title_kind=c.metadata.segment_type.value,
+                            target_id=c.chunk_id,
+                        )
+
+            # 6) 写入内存缓存，方便调试预览
+            DOC_CHUNKS[doc_id] = chunks
 
         # 7) 新建任务（计时器模拟阶段推进）
         task_id: TaskID = new_id("task_")

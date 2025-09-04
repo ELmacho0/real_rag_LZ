@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 import os
 
+
 # =========================
 # 枚举与类型别名
 # =========================
@@ -88,6 +89,13 @@ class Settings(BaseSettings):
     # —— Chroma 存储路径 ——
     CHROMA_PATH: str = "./data/chroma"
 
+    # —— 图像识别Vision / Qwen-VL ——
+    VISION_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    VISION_MODEL: str = "qwen-vl-max-2025-08-13"
+    VISION_PAGE_DPI: int = 220  # pdf2image 渲染像素密度
+    VISION_MAX_CANDS_PER_PAGE: int = 6  # 每页最多送几张裁图去判别
+    VISION_ENABLE: bool = True  # 可开关
+
     # —— rerank模型 ——
     RERANK_PROVIDER: str = "dashscope"
     RERANK_MODEL: str = "gte-rerank-v2"
@@ -144,6 +152,12 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_TASKS_PER_USER: int = 3
     ANSWER_FINAL_K: int = 4
 
+    # —— 表格识别限额 ——
+    VISION_SCAN_TEXT_CHAR_TH: int = 20  # 少于 N 个可提取字符 → 视为扫描页
+    VISION_NON_TEXT_MIN_AREA: float = 0.12  # 非文字连通域最小面积占比（扫描页）
+    VISION_NON_TEXT_MERGE_IOU: float = 0.20  # 非文字区域合并 IoU 阈值
+    VISION_TEXT_DILATE_PX: int = 8  # 文本框膨胀像素（扫描页）
+
     # —— ETA ——
     ETA_WINDOW_MINUTES: int = 30
     ETA_MIN_SAMPLE: int = 50
@@ -154,7 +168,6 @@ class Settings(BaseSettings):
 
     # —— 模型选择 ——
     LLM_CHAT_MODEL: str = "qwen-turbo"  # 示例；实际以你接的提供商为准
-
 
 
 # =========================

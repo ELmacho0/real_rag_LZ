@@ -10,7 +10,7 @@ from app.retrieval.rewrite import generate_rewrites
 from app.retrieval.rerank import get_rerank_client
 from app.retrieval.fusion import Cand, score, is_unreliable_top
 from app.retrieval.keyword import tokenize, score_text  # 作为最终兜底
-
+from app.core.settings import get_settings
 _ANSWERS: Dict[AnswerID, QAAnswer] = {}
 
 
