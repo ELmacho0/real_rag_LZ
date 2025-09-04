@@ -13,14 +13,12 @@ from app.storage.files import compute_doc_id, guess_file_type, save_original
 from app.storage.pdf_inspect import inspect_pdf
 from app.storage.docx_pdf import docx_to_pdf
 from app.storage.text_extractor import iter_pdf_page_texts, make_text_chunks_from_pages
-from app.storage.ocr_extractor import pdf_ocr_to_pages
 from app.storage.pdf_scan_detect import scan_pdf_tables_and_text
 from app.storage.pdf_visual import harvest_visual_cands
+from app.storage.excel_extractor import iter_excel_sheets
 from app.storage.vectorstore_chroma import upsert_chunks, upsert_title
 from app.llm.embeddings import get_embedding_client
 from app.llm.vision import analyze_image, table_json_to_text
-from app.llm.embeddings import get_embedding_client
-from app.utils.ids import new_id
 
 
 
@@ -46,6 +44,124 @@ class SimpleIngestService(IngestService):
       结果存进 _DOC_CHUNKS，供问答使用。
     - 注意：这里仍然用“8 秒计时器”来显示进度；真实环境将改为异步队列逐阶段推进。
     """
+
+    def _process_pdf_text(self, doc_id: str, path: Path, filename: str) -> List[Chunk]:
+        pages = list(iter_pdf_page_texts(path))
+        raw_chunks = make_text_chunks_from_pages(doc_id, pages, window_min=300, window_max=500, overlap=100)
+        chunks: List[Chunk] = []
+        for rc in raw_chunks:
+            chunk_id = new_id("chk_")
+            meta_obj = ChunkMeta(
+                chunk_id=chunk_id,
+                doc_id=doc_id,
+                segment_type=SegmentType.text,
+                page_from=rc["page_from"],
+                page_to=rc["page_to"],
+                title_guess="",
+                page_estimated=False,
+                appendix_flag=False,
+            )
+            chunks.append(Chunk(chunk_id=chunk_id, text=rc["text"], metadata=meta_obj))
+
+        # 视觉候选：表格与图片
+        for cand in harvest_visual_cands(str(path)):
+            obj = analyze_image(cand.crop_png)
+            kind = str(obj.get("kind", cand.kind_hint)).lower()
+            title = obj.get("title", "") or ""
+            if kind == "table":
+                payload_text = table_json_to_text(str(obj.get("table")))
+                seg_type = SegmentType.table
+            elif kind == "chart":
+                payload_text = obj.get("text", "") or title
+                seg_type = SegmentType.chart
+            elif kind == "figure":
+                payload_text = obj.get("text", "") or title
+                seg_type = SegmentType.figure
+            else:
+                payload_text = obj.get("text", "") or title
+                seg_type = SegmentType.photo
+
+            chunk_id = new_id("seg_")
+            meta_obj = ChunkMeta(
+                chunk_id=chunk_id,
+                doc_id=doc_id,
+                segment_type=seg_type,
+                page_from=cand.page,
+                page_to=cand.page,
+                title_guess=title,
+                page_estimated=False,
+                appendix_flag=False,
+            )
+            chunks.append(Chunk(chunk_id=chunk_id, text=payload_text, metadata=meta_obj))
+        return chunks
+
+    def _process_pdf_scan(self, doc_id: str, path: Path) -> List[Chunk]:
+        page_texts, table_crops = scan_pdf_tables_and_text(str(path), dpi=300)
+        chunks: List[Chunk] = []
+        for pt in page_texts:
+            text = pt.text.strip()
+            if not text:
+                continue
+            chunk_id = new_id("seg_")
+            meta = ChunkMeta(
+                chunk_id=chunk_id,
+                doc_id=doc_id,
+                segment_type=SegmentType.text,
+                page_from=pt.page,
+                page_to=pt.page,
+                title_guess="",
+                page_estimated=False,
+                appendix_flag=False,
+            )
+            chunks.append(Chunk(chunk_id=chunk_id, text=text, metadata=meta))
+
+        for tb in table_crops:
+            obj = analyze_image(tb.png_bytes)
+            kind = str(obj.get("kind", "table")).lower()
+            title = obj.get("title", "") or ""
+            table = obj.get("table")
+            if kind == "table":
+                payload_text = table_json_to_text(str(table))
+                seg_type = SegmentType.table
+            else:
+                payload_text = obj.get("text", "") or title
+                seg_type = SegmentType.chart if kind == "chart" else SegmentType.figure
+
+            chunk_id = new_id("seg_")
+            meta = ChunkMeta(
+                chunk_id=chunk_id,
+                doc_id=doc_id,
+                segment_type=seg_type,
+                page_from=tb.page,
+                page_to=tb.page,
+                title_guess=title,
+                page_estimated=False,
+                appendix_flag=False,
+            )
+            chunks.append(Chunk(chunk_id=chunk_id, text=payload_text, metadata=meta))
+        return chunks
+
+    def _process_docx(self, doc_id: str, path: Path, filename: str) -> List[Chunk]:
+        pdf_path = Path(docx_to_pdf(str(path)))
+        return self._process_pdf_text(doc_id, pdf_path, filename)
+
+    def _process_excel(self, doc_id: str, path: Path) -> List[Chunk]:
+        chunks: List[Chunk] = []
+        for sheet_name, sheet_json in iter_excel_sheets(path):
+            text = table_json_to_text(sheet_json)
+            chunk_id = new_id("seg_")
+            meta = ChunkMeta(
+                chunk_id=chunk_id,
+                doc_id=doc_id,
+                segment_type=SegmentType.excel_sheet,
+                page_from=None,
+                page_to=None,
+                title_guess=sheet_name,
+                page_estimated=False,
+                appendix_flag=False,
+            )
+            chunks.append(Chunk(chunk_id=chunk_id, text=text, metadata=meta))
+        return chunks
 
     def schedule_ingest(self, owner_id: UserID, filename: str, mime: str, file_bytes: bytes) -> Tuple[FileID, TaskID]:
 
@@ -109,116 +225,41 @@ class SimpleIngestService(IngestService):
         _FILE_META[file_id] = meta
         _DOC_READY[doc_id] = False
 
-        # 6) 文本型 PDF：同步文本抽取与切片
-        if meta.file_type in (FileType.pdf_text,):
-            pages = list(iter_pdf_page_texts(saved_path))
-            # 生成“窗口化切片”（返回字典列表）
-            raw_chunks = make_text_chunks_from_pages(doc_id, pages, window_min=300, window_max=500, overlap=100)
-            chunks: List[Chunk] = []
-            for rc in raw_chunks:
-                chunk_id = new_id("chk_")
-                meta_obj = ChunkMeta(
-                    chunk_id=chunk_id,  # 如果你这里写过，记得：chunk_id 其实在 Chunk() 里，不在 ChunkMeta 里
-                    doc_id=doc_id,
-                    segment_type=SegmentType.text,
-                    page_from=rc["page_from"],
-                    page_to=rc["page_to"],
-                    title_guess="",
-                    page_estimated=False,
-                    appendix_flag=False,
-                    # ↓↓↓ 这四个都可以不写，默认 None。先保留做占位，后面接邻近召回时再填。
-                    neighbors_prev_page=None,
-                    neighbors_next_page=None,
-                    neighbors_prev_chunk_id=None,
-                    neighbors_next_chunk_id=None,
-                )
-                chunks.append(Chunk(chunk_id=chunk_id, text=rc["text"], metadata=meta_obj))
+        # 6) 根据文件类型处理内容并切片
+        chunks: List[Chunk] = []
+        if meta.file_type == FileType.pdf_text:
+            chunks = self._process_pdf_text(doc_id, saved_path, filename)
+        elif meta.file_type == FileType.pdf_scan:
+            chunks = self._process_pdf_scan(doc_id, saved_path)
+        elif meta.file_type == FileType.docx:
+            chunks = self._process_docx(doc_id, saved_path, filename)
+        elif meta.file_type == FileType.xlsx:
+            chunks = self._process_excel(doc_id, saved_path)
+
+        if chunks:
             _DOC_CHUNKS[doc_id] = chunks
-            # try:
-            embedder = get_embedding_client()  # 若未配置会抛异常，我们捕获后允许回退
-            texts = [c.text for c in chunks]
-            vecs = embedder.embed_texts(texts)
-            upsert_chunks(owner_id, chunks, vecs)
-            upsert_title(owner_id, doc_id, title_text=filename, filename=filename)
-            # except Exception as e:
-            #     # 记录一下即可（此阶段允许无向量索引，问答会回退到关键词）
-            #     print("向量写入失败")
-            #     pass
-
-        # 6.1) 扫描型 PDF：逐页 OCR → 切片（与文本型相同窗口策略）
-        elif meta.file_type in (FileType.pdf_scan,):
-            page_texts, table_crops = scan_pdf_tables_and_text(str(saved_path), dpi=300)
-
-            chunks: list[Chunk] = []
-
-            # 2) 文本页 → 切片（简单：一页一片，或拼成长段再按窗口切）
-            for pt in page_texts:
-                text = pt.text.strip()
-                if not text:
-                    continue
-                # 可按你现有的窗口/重叠策略，这里先一页一片
-                chunk_id = new_id("seg_")
-                meta = ChunkMeta(
-                    chunk_id=chunk_id,
-                    doc_id=doc_id,
-                    segment_type=SegmentType.text,
-                    page_from=pt.page,
-                    page_to=pt.page,
-                    title_guess="",
-                    page_estimated=False,
-                    appendix_flag=False,
-                )
-                chunks.append(Chunk(chunk_id=chunk_id, text=text, metadata=meta))
-
-            # 3) 表格裁片 → 视觉 LLM 判类 + 文本化
-            for tb in table_crops:
-                obj = analyze_image(tb.png_bytes)  # {kind,title,text,table:{...}}
-                kind = str(obj.get("kind", "table")).lower()
-                title = obj.get("title", "") or ""
-                table = obj.get("text")
-                if kind == "table":
-                    payload_text = table_json_to_text(str(table))
-                    seg_type = SegmentType.table
-                    class_bonus_hint = "table"
-                else:
-                    # 扫描件里通常不会识别成 chart/figure，但保留兼容
-                    payload_text = obj.get("text", "") or title
-                    seg_type = SegmentType.figure if kind not in ("chart", "photo") else SegmentType.chart
-                    class_bonus_hint = "chart" if kind == "chart" else "figure"
-
-                meta = ChunkMeta(
-                    chunk_id=chunk_id,
-                    doc_id=doc_id,
-                    segment_type=seg_type,
-                    page_from=tb.page,
-                    page_to=tb.page,
-                    title_guess=title,
-                    page_estimated=False,
-                    appendix_flag=False,
-                )
-                chunks.append(Chunk(chunk_id=new_id("seg_"), text=payload_text, metadata=meta))
-
-            # 4) 入向量库
-            if chunks:
+            try:
                 embedder = get_embedding_client()
                 vecs = embedder.embed_texts([c.text for c in chunks])
                 upsert_chunks(owner_id, chunks, vecs)
-
-                # 5) 将非文字切片写入标题索引（便于“标题命中 → 直达该切片”）
+                upsert_title(owner_id, doc_id, title_text=filename, filename=filename)
                 for c in chunks:
-                    if c.metadata.segment_type in (SegmentType.table, SegmentType.chart) and c.metadata.title_guess:
+                    if c.metadata.segment_type in (
+                        SegmentType.table,
+                        SegmentType.chart,
+                        SegmentType.figure,
+                        SegmentType.excel_sheet,
+                    ) and c.metadata.title_guess:
                         upsert_title(
                             owner_id=owner_id,
                             doc_id=doc_id,
                             title_text=c.metadata.title_guess,
                             filename=filename,
-                            # 如果你已把 upsert_title 增强为可写元数据：
                             title_kind=c.metadata.segment_type.value,
                             target_id=c.chunk_id,
                         )
-
-            # 6) 写入内存缓存，方便调试预览
-            DOC_CHUNKS[doc_id] = chunks
+            except Exception:
+                pass
 
         # 7) 新建任务（计时器模拟阶段推进）
         task_id: TaskID = new_id("task_")
