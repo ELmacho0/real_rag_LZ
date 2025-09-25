@@ -16,7 +16,7 @@ def guess_file_type(filename: str, mime: str | None) -> FileType:
     name = (filename or "").lower()
     if name.endswith(".pdf"):
         return FileType.pdf_text
-    if name.endswith(".docx"):
+    if name.endswith(".docx") or name.endswith(".doc"):
         return FileType.docx
     if name.endswith(".xlsx"):
         return FileType.xlsx
