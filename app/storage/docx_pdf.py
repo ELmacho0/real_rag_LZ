@@ -6,15 +6,16 @@ from pathlib import Path
 
 def docx_to_pdf(input_path: str) -> str:
     """
-    将 .docx 转为 .pdf，返回生成的 PDF 路径。
+    将 .doc/.docx 转为 .pdf，返回生成的 PDF 路径。
     - 优先使用 docx2pdf（Windows 下依赖已安装的 MS Word）
     - 失败则抛异常（后续你需要备用方案可再加）
     """
     from docx2pdf import convert  # 延迟导入，避免非 Windows 环境报错
 
     input_path = str(Path(input_path).resolve())
-    if not input_path.lower().endswith(".docx"):
-        raise ValueError("docx_to_pdf only accepts .docx")
+    lower_input = input_path.lower()
+    if not (lower_input.endswith(".docx") or lower_input.endswith(".doc")):
+        raise ValueError("docx_to_pdf only accepts .docx/.doc")
 
     tmpdir = tempfile.mkdtemp(prefix="docx2pdf_")
     out_pdf = str(Path(tmpdir) / (Path(input_path).stem + ".pdf"))
