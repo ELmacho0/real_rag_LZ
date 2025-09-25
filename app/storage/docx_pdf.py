@@ -18,10 +18,15 @@ def docx_to_pdf(input_path: str) -> str:
         raise ValueError("docx_to_pdf only accepts .docx/.doc")
 
     tmpdir = tempfile.mkdtemp(prefix="docx2pdf_")
-    out_pdf = str(Path(tmpdir) / (Path(input_path).stem + ".pdf"))
+    out_pdf_path = Path(tmpdir) / (Path(input_path).stem + ".pdf")
+    out_pdf = str(out_pdf_path)
     try:
-        # docx2pdf 支持 (in_file, out_file) 直接转换
-        convert(input_path, out_pdf)
+        if lower_input.endswith(".docx"):
+            # docx2pdf 支持 (in_file, out_file) 直接转换
+            convert(input_path, out_pdf)
+        else:
+            _convert_doc_to_pdf(input_path, out_pdf)
+
         if not os.path.exists(out_pdf):
             raise RuntimeError("docx2pdf convert finished but output missing")
         return out_pdf
@@ -29,3 +34,39 @@ def docx_to_pdf(input_path: str) -> str:
         # 清理并上抛，方便上层 fallback（如果以后你要加备用方案）
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
+
+
+def _convert_doc_to_pdf(input_path: str, out_pdf: str) -> None:
+    """使用 Windows Word COM 接口将 .doc 转成 PDF。"""
+
+    input_abs = str(Path(input_path).resolve())
+    out_pdf_abs = str(Path(out_pdf).resolve())
+
+    try:
+        import win32com.client  # type: ignore
+    except ImportError:
+        win32com = None
+
+    word = None
+    document = None
+    try:
+        if win32com is not None:
+            word = win32com.DispatchEx("Word.Application")
+        else:
+            try:
+                import comtypes.client
+            except ImportError as exc:  # pragma: no cover - 平台相关
+                raise RuntimeError(
+                    "Converting .doc files requires pywin32 or comtypes"
+                ) from exc
+            word = comtypes.client.CreateObject("Word.Application")
+
+        word.Visible = False
+        word.DisplayAlerts = 0
+        document = word.Documents.Open(input_abs)
+        document.SaveAs(out_pdf_abs, FileFormat=17)  # 17 == wdFormatPDF
+    finally:
+        if document is not None:
+            document.Close(False)
+        if word is not None:
+            word.Quit()
