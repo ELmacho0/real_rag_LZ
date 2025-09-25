@@ -43,15 +43,19 @@ def _convert_doc_to_pdf(input_path: str, out_pdf: str) -> None:
     out_pdf_abs = str(Path(out_pdf).resolve())
 
     try:
+
         import win32com.client  # type: ignore
     except ImportError:
         win32com = None
 
+
     word = None
     document = None
     try:
+
         if win32com is not None:
             word = win32com.DispatchEx("Word.Application")
+
         else:
             try:
                 import comtypes.client
